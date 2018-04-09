@@ -1,0 +1,18 @@
+{
+  "spark.master": "local[*]",
+  "spark.appName": "SP ingester",
+  "spark.generalSettings":{
+    "spark.driver.memory": "12g",
+    "spark.executor.instances": "4",
+    "spark.executor.cores": "4",
+    "spark.executor.memory": "12g",
+    "spark.serializer": "org.apache.spark.serializer.KryoSerializer",
+    "spark.kryo.registrator": "geotrellis.spark.io.kryo.KryoRegistrator"
+  },
+  "ingestion":{
+    "inputFolder": "/rasters",
+    "outputCatalog": "/catalog",
+    "layerName": "SP",
+    "resolutionThreshold": 0.00001
+  }
+}

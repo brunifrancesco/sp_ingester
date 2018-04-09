@@ -1,5 +1,8 @@
 package ingester
 
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+import com.fasterxml.jackson.module.scala.experimental.ScalaObjectMapper
 import geotrellis.raster._
 import geotrellis.raster.resample._
 import geotrellis.proj4._
@@ -15,63 +18,79 @@ import org.apache.spark._
 import org.apache.spark.rdd._
 import org.apache.spark.storage.StorageLevel
 
-object Main extends App {
-  val inputDir = args(0)
-  val outputCatalog = args(1)
-  val layerName = args(2)
-  val noDataValue = args(3)
+import scala.io.Source
 
-  val conf =
-    new SparkConf()
-      .setMaster("local[1]")
-      .setAppName("Spark Tiler")
-      .set("spark.executor.instances", "1")
-      .set("spark.executor.cores", "1")
-      .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
-      .set("spark.kryo.registrator", "geotrellis.spark.io.kryo.KryoRegistrator")
+object Main {
+  def main(args: Array[String]): Unit = {
+    val json = Source.fromFile(args(0))
+    val mapper = new ObjectMapper() with ScalaObjectMapper
+    mapper.registerModule(DefaultScalaModule)
+    val parsedJson = mapper.readValue[Map[String, Object]](json.reader())
+    val masterUrl = parsedJson.getOrElse("spark.master", "local[*]").toString
+    val appName = parsedJson.getOrElse("spark.appName", "Spark Ingester").toString
+    val generalSettings =
+      parsedJson.getOrElse("spark.generalSettings", Map[String, String]())
+        .asInstanceOf[Map[String, String]]
+    val ingesterSettings: Map[String, String] = parsedJson.getOrElse("ingestion", Map[String, String]())
+      .asInstanceOf[Map[String, String]]
 
-  implicit val sc = new SparkContext(conf)
-  try {
+    val conf =
+      new SparkConf()
+        .setMaster(masterUrl)
+        .setAppName(appName)
 
-    val inputRdd: RDD[(ProjectedExtent, MultibandTile)] =
-      sc.hadoopMultibandGeoTiffRDD(inputDir).mapValues(_.withNoData(Some(noDataValue.toDouble)))
+    generalSettings.foreach((setting) =>
+      conf.set(setting._1, setting._2)
+    )
 
-    println(s"Partitions: ${inputRdd.partitions.length}")
+    implicit val sc = new SparkContext(conf)
+    try {
 
-    val (_, rasterMetaData) =
-      TileLayerMetadata.fromRdd(inputRdd, FloatingLayoutScheme(512))
+      val inputRdd: RDD[(ProjectedExtent, MultibandTile)] =
+        sc.hadoopMultibandGeoTiffRDD(ingesterSettings.getOrElse("inputFolder", "/home/bruni/rasters")).mapValues(_.withNoData(Some(-999999)))
 
-    val tiled: RDD[(SpatialKey, MultibandTile)] =
-      inputRdd
-        .tileToLayout(rasterMetaData.cellType, rasterMetaData.layout, Bilinear)
-        .repartition(200)
-        .persist(StorageLevel.MEMORY_AND_DISK_SER)
+      println(s"Partitions: ${inputRdd.partitions.length}")
 
-    val layoutScheme = ZoomedLayoutScheme(WebMercator, tileSize = 256, resolutionThreshold = 0.00001)
+      val (_, rasterMetaData) =
+        TileLayerMetadata.fromRdd(inputRdd, FloatingLayoutScheme(ingesterSettings.getOrElse("tileSize", 256).asInstanceOf[Int]))
 
-    // We need to reproject the tiles to WebMercator
-    val (_, reprojected): (Int, RDD[(SpatialKey, MultibandTile)] with Metadata[TileLayerMetadata[SpatialKey]]) =
-          MultibandTileLayerRDD(tiled, rasterMetaData)
-       .reproject(WebMercator, layoutScheme, Bilinear)
-    reprojected.persist(StorageLevel.MEMORY_AND_DISK_SER)
+      val tiled: RDD[(SpatialKey, MultibandTile)] =
+        inputRdd
+          .tileToLayout(rasterMetaData.cellType, rasterMetaData.layout, Bilinear)
+          .repartition(inputRdd.partitions.length / 100)
+          .persist(StorageLevel.MEMORY_AND_DISK_SER)
 
-    // Create the attributes store that will tell us information about our catalog.
-    val attributeStore = FileAttributeStore(outputCatalog)
+      val layoutScheme = ZoomedLayoutScheme(
+        WebMercator,
+        tileSize = ingesterSettings.getOrElse("tileSize", 256).asInstanceOf[Int],
+        resolutionThreshold = ingesterSettings.getOrElse("resolutionTreshold", 0.1).asInstanceOf[Double]
+      )
 
-    // Create the writer that we will use to store the tiles in the local catalog.
-    val writer = FileLayerWriter(attributeStore)
+      // We need to reproject the tiles to WebMercator
+      val (_, reprojected): (Int, RDD[(SpatialKey, MultibandTile)] with Metadata[TileLayerMetadata[SpatialKey]]) =
+        MultibandTileLayerRDD(tiled, rasterMetaData)
+          .reproject(WebMercator, layoutScheme, Bilinear)
 
-    // Pyramiding up the zoom levels, write our tiles out to the local file system.
-    Pyramid.upLevels(reprojected, layoutScheme, 10, Bilinear) { (rdd, z) =>
-      val layerId = LayerId(layerName, z)
-      // If the layer exists already, delete it out before writing
-      if(attributeStore.layerExists(layerId)) {
-        new FileLayerManager(attributeStore).delete(layerId)
+      // Create the attributes store that will tell us information about our catalog.
+      val attributeStore = FileAttributeStore(ingesterSettings.getOrElse("outputCatalog", "/home/bruni/catalog"))
+
+      // Create the writer that we will use to store the tiles in the local catalog.
+      val writer = FileLayerWriter(attributeStore)
+
+      // Pyramiding up the zoom levels, write our tiles out to the local file system.
+      Pyramid.upLevels(reprojected, layoutScheme, 22, Bilinear) { (rdd, z) =>
+        val layerId = LayerId(ingesterSettings.getOrElse("layerName", "SP"), z)
+        // If the layer exists already, delete it out before writing
+        if (attributeStore.layerExists(layerId)) {
+          new FileLayerManager(attributeStore).delete(layerId)
+        }
+        writer.write(layerId, rdd, ZCurveKeyIndexMethod)
       }
-      writer.write(layerId, rdd, ZCurveKeyIndexMethod)
-    }
 
-  } finally {
-    sc.stop()
+    } finally {
+      sc.stop()
+    }
   }
+
+
 }
